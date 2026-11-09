@@ -25,6 +25,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { apnsSignerFromEnv, apnsTopic, apnsHost, apnsRequestHeaders, clampBatch, validateNotification, resultFromResponse } from './apns.mjs';
 import { fcmSenderFromEnv, deliverPush } from './fcm.mjs';
 import {
+    AckBatcher,
     BIN,
     BODY_SLICE,
     BODY_WINDOW,
@@ -36,7 +37,9 @@ import {
     isTokenHash,
     negotiateProtocol,
     parseClientPath,
+    PROTOCOL,
     sanitizeCloseCode,
+    streamWindow,
     turnCredentials,
 } from './shared.mjs';
 
@@ -44,6 +47,7 @@ const env = process.env;
 const PORT = Number(env.PORT || 8787);
 const HOST = env.HOST || '0.0.0.0';
 const MB = 1024 * 1024;
+const mb = bytes => `${(bytes / MB).toFixed(1)} MB`;
 /** A non-negative number from the environment, or the default. 0 means "no limit". */
 const limit = (value, fallback) => {
     const n = Number(value);
@@ -57,8 +61,11 @@ const MAX_SOCKETS_PER_AGENT = limit(env.MAX_SOCKETS_PER_AGENT, 256); // concurre
 const MAX_CONNECTIONS = limit(env.MAX_CONNECTIONS, 0); // TCP connections to this process
 const STALL_MS = limit(env.STALL_TIMEOUT_S, 60) * 1000; // a phone that drains nothing for this long is cut off
 // Highest agent protocol this relay speaks (docs/PROTOCOL.md). 1 turns off
-// binary frames and request body streaming for every desktop.
-const RELAY_PROTOCOL = negotiateProtocol(env.RELAY_PROTOCOL || 2);
+// binary frames and request body streaming for every desktop; 2 turns off
+// per-stream flow control.
+const RELAY_PROTOCOL = negotiateProtocol(env.RELAY_PROTOCOL || PROTOCOL);
+// Protocol 3: how far ahead of the relay's acks a desktop may send on one stream.
+const STREAM_WINDOW = streamWindow(env.FLOW_STREAM_WINDOW_KB);
 const HEAD_TIMEOUT_MS = 120_000; // waiting for the desktop to answer
 const REGISTER_TIMEOUT_MS = 10_000; // an agent socket must register within this
 const PING_INTERVAL_MS = 30_000;
@@ -69,9 +76,15 @@ const CLIENT_MAX_MESSAGE = 24 * MB; // base64 makes it at most 32 MiB in a wmsg 
 const OPEN_QUEUE_MAX = 4 * MB; // phone bytes held while the desktop opens its side
 // Flow control: above HIGH_WATER buffered bytes the sender is paused until
 // the buffer drains below LOW_WATER.
-const HIGH_WATER = 8 * MB;
-const LOW_WATER = 1 * MB;
+const HIGH_WATER = (limit(env.FLOW_HIGH_WATER_MB, 8) || 8) * MB;
+const LOW_WATER = Math.min((limit(env.FLOW_LOW_WATER_MB, 1) || 1) * MB, HIGH_WATER / 2);
 const FLOW_TICK_MS = 25;
+// While the agent socket is paused the relay can't read the desktop's pings,
+// so it sends unsolicited pongs (RFC 6455 §5.5.3) on this interval: a desktop
+// that is being pushed back on must not take the relay for gone and redial.
+const PAUSED_PONG_MS = 5_000;
+// A pause this long is logged (with its cause and, at the end, its length).
+const PAUSE_LOG_MS = 2_000;
 
 // ---------------------------------------------------------------------------
 // APNs (optional). With no key the relay answers `unsupported` and the
@@ -186,7 +199,77 @@ class Agent {
         /** phone WebSockets and uploads paused until the agent socket drains */
         this.waiting = new Set();
         this.paused = false;
+        /** when this pause began, the last unsolicited pong, the sink that caused it, and whether it was logged */
+        this.pause = null;
         this.flowTimer = null;
+        // Protocol 3: each stream is acknowledged as its bytes leave for the
+        // phone, so the desktop holds back only the stream of a slow phone
+        // and the agent socket is never paused for it (`congested` stays as
+        // a safety net for a desktop that ignores its window).
+        this.acks = proto >= 3 ? new AckBatcher((id, n) => this.send({ t: 'ack', id, n })) : null;
+        /** key -> {n, since, gone, kill}: protocol-3 bytes handed to a phone sink, not yet written out */
+        this.owed = new Map();
+        this.stallTimer = null;
+    }
+
+    /**
+     * Protocol 3: `n` bytes of stream `id` were handed to a phone sink.
+     * Returns the write callback that acknowledges them to the desktop once
+     * they are written out (undefined below protocol 3). A sink that writes
+     * none of what it owes for STALL_MS is cut off with `kill()`.
+     */
+    deliver(id, key, n, gone, kill) {
+        if (!this.acks) return undefined;
+        let debt = this.owed.get(key);
+        if (!debt) {
+            debt = { n: 0, since: Date.now(), gone, kill };
+            this.owed.set(key, debt);
+            if (STALL_MS && !this.stallTimer) this.stallTimer = setInterval(() => this.checkStalls(), Math.min(1000, STALL_MS / 2));
+        }
+        debt.n += n;
+        return err => {
+            if (this.owed.get(key) !== debt) return;
+            if (err) return void this.owed.delete(key);
+            debt.n -= n;
+            debt.since = Date.now();
+            if (debt.n <= 0) this.owed.delete(key);
+            this.acks.add(id, n);
+        };
+    }
+
+    checkStalls() {
+        const now = Date.now();
+        for (const [key, debt] of this.owed) {
+            if (debt.gone()) {
+                this.owed.delete(key);
+            } else if (now - debt.since > STALL_MS) {
+                console.log(`[relay] agent ${this.tag}: ${key} wrote nothing for ${STALL_MS / 1000}s with ${mb(debt.n)} owed; cut off`);
+                this.owed.delete(key);
+                try {
+                    debt.kill();
+                } catch {}
+            }
+        }
+        if (!this.owed.size) this.stopStallWatch();
+    }
+
+    stopStallWatch() {
+        clearInterval(this.stallTimer);
+        this.stallTimer = null;
+    }
+
+    /** A short, non-secret tag for logs. */
+    get tag() {
+        return this.tokenHash.slice(0, 8);
+    }
+
+    /** Keep the desktop's heartbeat satisfied while its socket isn't read. */
+    keepAlive(now) {
+        if (now - this.pause.ponged < PAUSED_PONG_MS || this.ws.readyState !== WebSocket.OPEN) return;
+        this.pause.ponged = now;
+        try {
+            this.ws.pong();
+        } catch {}
     }
 
     send(frame) {
@@ -222,6 +305,8 @@ class Agent {
         if (!this.paused) {
             this.paused = true;
             this.ws.pause();
+            this.pause = { since: Date.now(), ponged: 0, key, bytes: level(), logged: false };
+            this.keepAlive(this.pause.since);
         }
         this.startFlow();
     }
@@ -248,6 +333,7 @@ class Agent {
                 sink.last = level;
                 sink.since = now;
             } else if (STALL_MS && now - sink.since > STALL_MS) {
+                console.log(`[relay] agent ${this.tag}: ${key} drained nothing for ${STALL_MS / 1000}s with ${mb(level)} queued; cut off`);
                 this.sinks.delete(key);
                 try {
                     sink.kill();
@@ -257,7 +343,15 @@ class Agent {
         if (this.paused && !this.sinks.size) {
             this.paused = false;
             this.isAlive = true; // pongs were not read while paused
+            if (this.pause.logged) console.log(`[relay] agent ${this.tag}: reading again after ${((now - this.pause.since) / 1000).toFixed(1)}s`);
+            this.pause = null;
             if (this.ws.readyState === WebSocket.OPEN) this.ws.resume();
+        } else if (this.paused) {
+            this.keepAlive(now);
+            if (!this.pause.logged && now - this.pause.since >= PAUSE_LOG_MS) {
+                this.pause.logged = true;
+                console.log(`[relay] agent ${this.tag}: not reading it, ${this.pause.key} has ${mb(this.pause.bytes)} queued for the phone (over ${mb(HIGH_WATER)})`);
+            }
         }
         if (this.waiting.size && (this.ws.bufferedAmount < LOW_WATER || this.ws.readyState !== WebSocket.OPEN)) {
             for (const source of this.waiting) source.resume();
@@ -274,6 +368,9 @@ class Agent {
     /** Fail in-flight requests and close every bridged phone socket. */
     destroy(reason = 'Desktop disconnected') {
         this.stopFlow();
+        this.stopStallWatch();
+        this.owed.clear();
+        this.acks?.clear();
         this.sinks.clear();
         this.waiting.clear();
         for (const [id, entry] of this.http) {
@@ -684,7 +781,7 @@ function handleAgent(ws) {
             const proto = negotiateProtocol(frame.proto, RELAY_PROTOCOL);
             agent = new Agent(ws, frame.tokenHash, frame.name, proto);
             agents.set(frame.tokenHash, agent);
-            ws.send(JSON.stringify({ t: 'registered', proto }));
+            ws.send(JSON.stringify({ t: 'registered', proto, ...(proto >= 3 ? { window: STREAM_WINDOW } : {}) }));
             console.log(`[relay] agent registered${auth.subject ? ` for ${auth.subject}` : ''}; agents=${agents.size}`);
             return;
         }
@@ -807,7 +904,11 @@ function handleAgent(ws) {
 
     ws.on('close', () => {
         clearTimeout(registerTimer);
-        if (agent) agent.stopFlow();
+        if (agent) {
+            agent.stopFlow();
+            agent.stopStallWatch();
+            agent.acks?.clear();
+        }
         if (agent && agents.get(agent.tokenHash) === agent) {
             agents.delete(agent.tokenHash);
             agent.destroy();
@@ -835,19 +936,17 @@ function writeResponseBody(agent, id, bytes) {
     const entry = agent.http.get(id);
     if (!entry) return;
     const { res } = entry;
+    const kill = () => {
+        agent.http.delete(id);
+        agent.send({ t: 'hcancel', id });
+        res.destroy();
+    };
+    const written = agent.deliver(id, `h:${id}`, bytes.length, () => res.destroyed, kill);
     try {
-        res.write(bytes);
+        res.write(bytes, written);
     } catch {}
     if (res.writableLength > HIGH_WATER) {
-        agent.congested(
-            `h:${id}`,
-            () => (res.destroyed ? -1 : res.writableLength),
-            () => {
-                agent.http.delete(id);
-                agent.send({ t: 'hcancel', id });
-                res.destroy();
-            }
-        );
+        agent.congested(`h:${id}`, () => (res.destroyed ? -1 : res.writableLength), kill);
     }
 }
 
@@ -856,13 +955,12 @@ function sendToPhone(agent, id, data, isBinary) {
     const bridge = agent.sockets.get(id);
     if (!bridge || bridge.client.readyState !== WebSocket.OPEN) return;
     const { client } = bridge;
-    client.send(data, { binary: isBinary });
+    const kill = () => client.terminate(); // its close handler tells the desktop
+    const size = typeof data === 'string' ? Buffer.byteLength(data) : data.length;
+    const sent = agent.deliver(id, `w:${id}`, size, () => client.readyState !== WebSocket.OPEN, kill);
+    client.send(data, { binary: isBinary }, sent);
     if (client.bufferedAmount > HIGH_WATER) {
-        agent.congested(
-            `w:${id}`,
-            () => (client.readyState === WebSocket.OPEN ? client.bufferedAmount : -1),
-            () => client.terminate() // its close handler tells the desktop
-        );
+        agent.congested(`w:${id}`, () => (client.readyState === WebSocket.OPEN ? client.bufferedAmount : -1), kill);
     }
 }
 
