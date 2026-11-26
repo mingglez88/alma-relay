@@ -14,7 +14,12 @@
 // Worker. The Node edition swaps in `sendWithHttp2` because Node's fetch
 // speaks HTTP/1.1 only and APNs requires HTTP/2.
 
-const TOKEN_TTL_MS = 50 * 60 * 1000; // Apple accepts a provider token for 60 min
+// Apple accepts a provider token for 60 min and answers
+// TooManyProviderTokenUpdates when a key's token changes more often than
+// every 20 min. One token is minted per key and reused until this age; a
+// relay with many tunnels must share it (cloudflare/worker.mjs), not mint
+// one per tunnel or per wake-up.
+export const TOKEN_TTL_MS = 45 * 60 * 1000;
 const HOSTS = { production: 'api.push.apple.com', development: 'api.sandbox.push.apple.com' };
 const MAX_BATCH = 64;
 
@@ -36,20 +41,50 @@ function pemToPkcs8(pem) {
     return out.buffer;
 }
 
-/** Mints and caches the ES256 provider token Apple wants in `authorization`. */
+/**
+ * Mints and caches the ES256 provider token Apple wants in `authorization`.
+ * Concurrent callers share one in-flight signature, and a token is replaced
+ * only when it is older than TOKEN_TTL_MS or Apple rejected that very token
+ * as expired (refresh).
+ */
 export class ApnsSigner {
-    constructor({ key, keyId, teamId }) {
+    constructor({ key, keyId, teamId, now = Date.now }) {
         if (!key || !keyId || !teamId) throw new Error('APNs signer needs key, keyId and teamId');
         this.pem = key;
         this.keyId = keyId;
         this.teamId = teamId;
+        this.now = now;
         this.cryptoKey = null;
         this.cached = null; // {token, at}
+        this.inflight = null;
+    }
+
+    /** The cached {token, at} while it is fresh, else a newly minted one. */
+    async current() {
+        if (this.cached && this.now() - this.cached.at < TOKEN_TTL_MS) return this.cached;
+        return this.mintOnce();
     }
 
     async token() {
-        const now = Date.now();
-        if (this.cached && now - this.cached.at < TOKEN_TTL_MS) return this.cached.token;
+        return (await this.current()).token;
+    }
+
+    /** Apple answered ExpiredProviderToken for `rejected`: mint anew, unless a newer token already replaced it. */
+    async refresh(rejected) {
+        if (this.cached && this.cached.token === rejected) this.cached = null;
+        return (await this.current()).token;
+    }
+
+    mintOnce() {
+        if (!this.inflight)
+            this.inflight = this.mint().finally(() => {
+                this.inflight = null;
+            });
+        return this.inflight;
+    }
+
+    async mint() {
+        const now = this.now();
         if (!this.cryptoKey) {
             this.cryptoKey = await crypto.subtle.importKey('pkcs8', pemToPkcs8(this.pem), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
         }
@@ -59,10 +94,53 @@ export class ApnsSigner {
         // WebCrypto ECDSA signatures are already r||s (IEEE P1363), which is
         // exactly the JWS encoding — no DER juggling.
         const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, this.cryptoKey, new TextEncoder().encode(signingInput));
-        const token = `${signingInput}.${b64url(sig)}`;
-        this.cached = { token, at: now };
-        return token;
+        this.cached = { token: `${signingInput}.${b64url(sig)}`, at: now };
+        return this.cached;
     }
+}
+
+/**
+ * A provider token kept somewhere else (the Cloudflare edition's one token
+ * Durable Object), cached here with the age it was minted at. `fetch(rejected)`
+ * returns {token, at}; `rejected` is the token Apple called expired, or null.
+ * Same interface as ApnsSigner (token, refresh), one in-flight fetch at a time.
+ */
+export class SharedApnsToken {
+    constructor(fetch, { now = Date.now } = {}) {
+        this.fetch = fetch;
+        this.now = now;
+        this.cached = null;
+        this.inflight = null;
+    }
+
+    async token() {
+        if (this.cached && this.now() - this.cached.at < TOKEN_TTL_MS) return this.cached.token;
+        return (await this.load(null)).token;
+    }
+
+    async refresh(rejected) {
+        if (this.inflight) await this.inflight.catch(() => {});
+        if (this.cached && this.cached.token !== rejected && this.now() - this.cached.at < TOKEN_TTL_MS) return this.cached.token;
+        return (await this.load(rejected)).token;
+    }
+
+    load(rejected) {
+        if (!this.inflight)
+            this.inflight = (async () => {
+                const got = await this.fetch(rejected);
+                if (!got || typeof got.token !== 'string' || typeof got.at !== 'number') throw new Error('APNs token source returned no token');
+                this.cached = { token: got.token, at: got.at };
+                return this.cached;
+            })().finally(() => {
+                this.inflight = null;
+            });
+        return this.inflight;
+    }
+}
+
+/** Whether Apple's answer asks for a fresh provider token (retry the notification once). */
+export function isExpiredProviderToken(result) {
+    return result?.status === 403 && result.reason === 'ExpiredProviderToken';
 }
 
 /** Build a signer from an env-like object, or null when no key is configured. */
@@ -132,13 +210,18 @@ export async function sendWithFetch(signer, topic, notifications, fetchImpl = fe
             continue;
         }
         try {
+            const post = async auth => {
+                const res = await fetchImpl(`https://${apnsHost(n.environment)}/3/device/${n.token}`, {
+                    method: 'POST',
+                    headers: apnsRequestHeaders(auth, topic, n),
+                    body: JSON.stringify(n.payload),
+                });
+                return resultFromResponse(res.status, await res.text());
+            };
             const auth = await signer.token();
-            const res = await fetchImpl(`https://${apnsHost(n.environment)}/3/device/${n.token}`, {
-                method: 'POST',
-                headers: apnsRequestHeaders(auth, topic, n),
-                body: JSON.stringify(n.payload),
-            });
-            results.push({ token: n.token, ...resultFromResponse(res.status, await res.text()) });
+            let result = await post(auth);
+            if (isExpiredProviderToken(result)) result = await post(await signer.refresh(auth));
+            results.push({ token: n.token, ...result });
         } catch (err) {
             results.push({ token: n.token, status: 0, reason: err instanceof Error ? err.message : String(err) });
         }
