@@ -56,6 +56,11 @@ const streamMaxBody = env => limit(env.MAX_BODY_MB, 100) * MB || Infinity;
 const stallMs = env => limit(env.STALL_TIMEOUT_S, 60) * 1000;
 const relayProtocol = env => negotiateProtocol(env.RELAY_PROTOCOL || PROTOCOL);
 const COALESCE_MS = 10;
+// Resume (see docs/PROTOCOL.md): how long phone sockets wait for a desktop
+// whose agent socket dropped to come back, and how much each may queue for it
+// meanwhile. Alma's desktop is back within 4 s nine times in ten (p99 23 s).
+const resumeGraceMs = env => limit(env.RESUME_GRACE_S, 30) * 1000;
+const PARK_QUEUE_MAX = 1 * MB;
 const TIMEOUT = Symbol('timeout');
 const sleep = ms => new Promise(resolve => setTimeout(() => resolve(TIMEOUT), ms));
 
@@ -189,6 +194,11 @@ export class TunnelDO extends DurableObject {
         // the DO cannot hibernate while one is active.
         this.pending = new Map(); // id -> {enqueue, close, fail, headResolve, timer, headersSent}
         this.preOpenQueues = new Map(); // client ws id -> frames queued until agent sends wopened
+        // Phone messages held while the desktop is away and may resume
+        // (client ws id -> {bytes, items}). In memory only: if the DO is
+        // evicted meanwhile they are lost, and the desktop's end-to-end
+        // layer finds the gap and drops that phone's socket alone.
+        this.parked = new Map();
         this.counter = 0;
         // Protocol 3: response body / WebSocket bytes acknowledged per stream.
         this.acks = new AckBatcher((id, n) => this.sendToAgent({ t: 'ack', id, n }));
@@ -607,6 +617,7 @@ export class TunnelDO extends DurableObject {
             // Phone -> desktop traffic on a bridged socket.
             const queue = this.preOpenQueues.get(attachment.id);
             if (queue) queue.push(message);
+            else if (!this.agentSocket()) this.park(ws, attachment.id, message);
             else this.sendWsToAgent(attachment.id, message);
             return;
         }
@@ -643,6 +654,7 @@ export class TunnelDO extends DurableObject {
                 return;
             }
             let replaced = false;
+            const parked = !this.agentSocket() && this.ctx.getWebSockets('client').length > 0;
             for (const other of this.ctx.getWebSockets('agent')) {
                 if (other !== ws) {
                     replaced = true;
@@ -667,10 +679,25 @@ export class TunnelDO extends DurableObject {
             // open, the phone keeps sending into a socket id the new agent has
             // never heard of: the edge still answers its pings, so it never
             // redials, and every request times out (Node edition: Agent.destroy).
-            if (replaced) this.dropTunnels('Desktop reconnected');
+            //
+            // Resume: a desktop that lists the phone sockets it still holds
+            // (`resume`) keeps those; each phone socket's fate is its own.
+            const resume = Array.isArray(frame.resume) ? new Set(frame.resume.map(String)) : null;
+            let resumed = null;
+            if (resume) resumed = this.resumeTunnels(resume);
+            else if (replaced || parked) this.dropTunnels('Desktop reconnected');
             const proto = negotiateProtocol(frame.proto, relayProtocol(this.env));
-            ws.serializeAttachment({ role: 'agent', registered: true, account, proto });
-            ws.send(JSON.stringify({ t: 'registered', proto, ...(proto >= 3 ? { window: streamWindow(this.env.FLOW_STREAM_WINDOW_KB) } : {}) }));
+            ws.serializeAttachment({ role: 'agent', registered: true, account, proto, resume: !!resume });
+            ws.send(
+                JSON.stringify({
+                    t: 'registered',
+                    proto,
+                    ...(proto >= 3 ? { window: streamWindow(this.env.FLOW_STREAM_WINDOW_KB) } : {}),
+                    ...(resumed ? { resumed: resumed.map(r => r.id) } : {}),
+                })
+            );
+            // Only now: the desktop must know the resumed ids before their messages arrive.
+            for (const { id, items } of resumed || []) for (const item of items) this.sendWsToAgent(id, item);
             if (account) console.log(`[relay] agent registered for account ${account}`);
             return;
         }
@@ -781,16 +808,38 @@ export class TunnelDO extends DurableObject {
         }
         const attachment = ws.deserializeAttachment() || {};
         if (attachment.role === 'agent' && attachment.registered) {
-            // Desktop went away: fail in-flight requests, drop bridged sockets.
-            this.dropTunnels('Desktop disconnected');
+            if (attachment.resume && this.ctx.getWebSockets('client').length) {
+                // A desktop that resumes is usually back in seconds: fail
+                // in-flight requests, but keep the phone sockets waiting.
+                this.failRequests();
+                await this.ctx.storage.setAlarm(Date.now() + resumeGraceMs(this.env));
+            } else {
+                // Desktop went away: fail in-flight requests, drop bridged sockets.
+                this.dropTunnels('Desktop disconnected');
+            }
         } else if (attachment.role === 'client') {
             this.preOpenQueues.delete(attachment.id);
+            this.parked.delete(attachment.id);
             this.sendToAgent({ t: 'wclose', id: attachment.id, code: 1000 });
         }
     }
 
     /** Fail in-flight requests and close every bridged phone socket. */
     dropTunnels(reason) {
+        this.failRequests();
+        this.parked.clear();
+        for (const client of this.ctx.getWebSockets('client')) {
+            try {
+                client.close(1012, reason);
+            } catch {
+                /* ignore */
+            }
+        }
+    }
+
+    /** Fail in-flight requests: they belonged to the agent socket that is gone. */
+    failRequests() {
+        this.acks.clear();
         for (const [id, entry] of this.pending) {
             clearTimeout(entry.timer);
             entry.wake?.();
@@ -799,13 +848,51 @@ export class TunnelDO extends DurableObject {
             this.pending.delete(id);
         }
         this.preOpenQueues.clear();
-        for (const client of this.ctx.getWebSockets('client')) {
+    }
+
+    /** Hold a phone message for a desktop that may resume; a phone that sends too much meanwhile is let go. */
+    park(ws, id, message) {
+        let held = this.parked.get(id);
+        if (!held) this.parked.set(id, (held = { bytes: 0, items: [] }));
+        held.bytes += typeof message === 'string' ? message.length * 3 : message.byteLength;
+        if (held.bytes > PARK_QUEUE_MAX) {
+            this.parked.delete(id);
             try {
-                client.close(1012, reason);
+                ws.close(1012, 'Desktop disconnected');
+            } catch {
+                /* ignore */
+            }
+            return;
+        }
+        held.items.push(message);
+    }
+
+    /**
+     * The desktop is back and still holds the phone sockets in `ids`: keep
+     * those (with what they sent meanwhile), close the rest.
+     */
+    resumeTunnels(ids) {
+        this.failRequests();
+        const kept = [];
+        for (const client of this.ctx.getWebSockets('client')) {
+            const id = client.deserializeAttachment()?.id;
+            if (id && ids.has(id)) {
+                kept.push({ id, items: this.parked.get(id)?.items || [] });
+                continue;
+            }
+            try {
+                client.close(1012, 'Desktop reconnected');
             } catch {
                 /* ignore */
             }
         }
+        this.parked.clear();
+        return kept;
+    }
+
+    /** The resume grace ran out: a desktop that did not come back loses its phones. */
+    async alarm() {
+        if (!this.agentSocket()) this.dropTunnels('Desktop disconnected');
     }
 
     async webSocketError(ws) {

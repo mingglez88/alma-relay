@@ -50,7 +50,7 @@ and the relay sends phone WebSocket messages that way; see below.
 
 When the agent socket closes, the relay fails in-flight requests with `502`
 and closes every bridged phone socket with `1012`, so phones redial instead of
-talking into a dead tunnel.
+talking into a dead tunnel, unless the desktop [resumes](#resume).
 
 ## Protocol 2
 
@@ -132,6 +132,39 @@ So a phone that stops reading holds back only its own stream. Before protocol
 3 the Node edition had to stop reading the whole agent socket for it (below),
 stalling every other phone and tunnel on that desktop; and the Cloudflare
 edition had to hold whatever the desktop sent in Durable Object memory.
+
+## Resume
+
+Relay ≥ 1.5.0, any protocol. A desktop that sends `resume` in `register` (an
+array, empty on its first connection) keeps its bridged phone sockets across a
+dropped agent socket, so a network blip between the desktop and the relay
+costs nothing on the phones' side, and the phones' sockets live and die one by
+one, never all at once.
+
+| Direction | Frame | Meaning |
+| --- | --- | --- |
+| agent → relay | `{t:'register', …, resume: [id, …]}` | The bridged sockets (`wopen` ids) the desktop still holds from its previous agent socket |
+| relay → agent | `{t:'registered', …, resumed: [id, …]}` | The ones the relay kept. The desktop drops the rest. |
+
+- When the agent socket of a resuming desktop closes, the relay fails its
+  in-flight requests with `502`, as before, but holds its phone sockets for
+  `RESUME_GRACE_S` (30 s). Meanwhile requests and new phone sockets get `502`,
+  and what the held phones send is queued (up to 1 MiB each; a phone that
+  sends more is closed with `1012`). A phone that closes meanwhile is simply
+  gone: the desktop learns it from `resumed`.
+- When the desktop registers again with `resume`, the relay keeps the listed
+  sockets, closes the other phone sockets with `1012`, answers `resumed`, and
+  only then delivers what the kept phones queued, in order.
+- A desktop that registers again without `resume`, or not within the grace,
+  loses every phone socket, as before. A newer agent socket that replaces a
+  live one (close `4000`) resumes the same way.
+- Protocol 3: credit starts afresh. Bytes un-acknowledged on the old agent
+  socket will never be acknowledged; the desktop resets every kept stream's
+  count to zero.
+- Messages in flight when the agent socket dropped may be lost both ways (and
+  a Cloudflare Durable Object evicted meanwhile forgets the queue). The relay
+  cannot tell; the layer above must. Alma's end-to-end encryption numbers
+  every message and drops a bridged socket that misses one.
 
 ## HTTP endpoints
 

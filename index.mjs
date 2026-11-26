@@ -74,6 +74,11 @@ const PING_INTERVAL_MS = 30_000;
 const AGENT_MAX_FRAME = 32 * MB;
 const CLIENT_MAX_MESSAGE = 24 * MB; // base64 makes it at most 32 MiB in a wmsg frame
 const OPEN_QUEUE_MAX = 4 * MB; // phone bytes held while the desktop opens its side
+// Resume (docs/PROTOCOL.md): how long phone sockets wait for a desktop whose
+// agent socket dropped, and what each may send meanwhile. Alma's desktop is
+// back within 4 s nine times in ten (p99 23 s).
+const RESUME_GRACE_MS = limit(env.RESUME_GRACE_S, 30) * 1000;
+const PARK_QUEUE_MAX = 1 * MB;
 // Flow control: above HIGH_WATER buffered bytes the sender is paused until
 // the buffer drains below LOW_WATER.
 const HIGH_WATER = (limit(env.FLOW_HIGH_WATER_MB, 8) || 8) * MB;
@@ -210,6 +215,10 @@ class Agent {
         /** key -> {n, since, gone, kill}: protocol-3 bytes handed to a phone sink, not yet written out */
         this.owed = new Map();
         this.stallTimer = null;
+        /** Whether this desktop resumes phone sockets across a reconnect (it sent `resume`) */
+        this.resumable = false;
+        /** Set while the agent socket is gone and phones wait for it to resume */
+        this.away = null;
     }
 
     /**
@@ -367,11 +376,42 @@ class Agent {
 
     /** Fail in-flight requests and close every bridged phone socket. */
     destroy(reason = 'Desktop disconnected') {
+        this.failRequests();
+        clearTimeout(this.away);
+        for (const [id, bridge] of this.sockets) {
+            try {
+                bridge.client.close(1012, reason);
+            } catch {}
+            this.sockets.delete(id);
+        }
+    }
+
+    /**
+     * The agent socket is gone but the desktop may resume: fail what was in
+     * flight on it, hold the phone sockets for RESUME_GRACE_MS.
+     */
+    goAway(onExpire) {
+        this.failRequests();
+        for (const bridge of this.sockets.values()) {
+            bridge.parked = [];
+            bridge.parkedBytes = 0;
+        }
+        this.away = setTimeout(onExpire, RESUME_GRACE_MS);
+        this.away.unref?.();
+    }
+
+    /** Fail in-flight requests: they belonged to the agent socket. */
+    failRequests() {
         this.stopFlow();
         this.stopStallWatch();
         this.owed.clear();
         this.acks?.clear();
         this.sinks.clear();
+        for (const source of this.waiting) {
+            try {
+                source.resume();
+            } catch {}
+        }
         this.waiting.clear();
         for (const [id, entry] of this.http) {
             clearTimeout(entry.timer);
@@ -382,12 +422,6 @@ class Agent {
                 entry.res.destroy();
             }
             this.http.delete(id);
-        }
-        for (const [id, bridge] of this.sockets) {
-            try {
-                bridge.client.close(1012, reason);
-            } catch {}
-            this.sockets.delete(id);
         }
     }
 }
@@ -518,7 +552,7 @@ const server = createServer((req, res) => {
         return;
     }
 
-    const agent = agents.get(sha256(parsed.code));
+    const agent = liveAgent(sha256(parsed.code));
     if (!agent) {
         respondJson(res, 502, { error: 'Desktop is offline or the connect code is invalid' });
         return;
@@ -708,6 +742,12 @@ const agentWss = new WebSocketServer({ noServer: true, maxPayload: AGENT_MAX_FRA
 const clientWss = new WebSocketServer({ noServer: true, maxPayload: CLIENT_MAX_MESSAGE });
 if (MAX_CONNECTIONS) server.maxConnections = MAX_CONNECTIONS;
 
+/** The registered desktop for `tokenHash`, unless it is away (waiting to resume). */
+function liveAgent(tokenHash) {
+    const agent = agents.get(tokenHash);
+    return agent && !agent.away ? agent : null;
+}
+
 function refuseUpgrade(socket, status) {
     socket.write(`HTTP/1.1 ${status}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n`);
     socket.destroy();
@@ -721,7 +761,7 @@ server.on('upgrade', (req, socket, head) => {
     }
     const parsed = parseClientPath(url);
     if (parsed) {
-        const agent = agents.get(sha256(parsed.code));
+        const agent = liveAgent(sha256(parsed.code));
         if (!agent) return refuseUpgrade(socket, '502 Bad Gateway');
         if (MAX_SOCKETS_PER_AGENT && agent.sockets.size >= MAX_SOCKETS_PER_AGENT) return refuseUpgrade(socket, '503 Service Unavailable');
         clientWss.handleUpgrade(req, socket, head, ws => handleClientSocket(ws, agent, parsed.rest));
@@ -772,16 +812,44 @@ function handleAgent(ws) {
                 return;
             }
             clearTimeout(registerTimer);
+            const proto = negotiateProtocol(frame.proto, RELAY_PROTOCOL);
+            agent = new Agent(ws, frame.tokenHash, frame.name, proto);
+            agent.resumable = Array.isArray(frame.resume);
+            // Resume: the phone sockets the desktop still holds move to the
+            // new agent socket, with what they sent meanwhile; only the rest
+            // are closed. Each phone socket's fate is its own.
+            const resumed = [];
             if (existing) {
+                if (agent.resumable) {
+                    const ids = new Set(frame.resume.map(String));
+                    agent.nextId = existing.nextId;
+                    for (const [id, bridge] of existing.sockets) {
+                        if (!ids.has(id) || !bridge.opened || bridge.client.readyState !== WebSocket.OPEN) continue;
+                        existing.sockets.delete(id);
+                        bridge.agent = agent;
+                        agent.sockets.set(id, bridge);
+                        resumed.push([id, bridge]);
+                    }
+                }
                 existing.destroy('Desktop reconnected');
                 try {
                     existing.ws.close(4000, 'Replaced by a newer connection');
                 } catch {}
             }
-            const proto = negotiateProtocol(frame.proto, RELAY_PROTOCOL);
-            agent = new Agent(ws, frame.tokenHash, frame.name, proto);
             agents.set(frame.tokenHash, agent);
-            ws.send(JSON.stringify({ t: 'registered', proto, ...(proto >= 3 ? { window: STREAM_WINDOW } : {}) }));
+            ws.send(
+                JSON.stringify({
+                    t: 'registered',
+                    proto,
+                    ...(proto >= 3 ? { window: STREAM_WINDOW } : {}),
+                    ...(agent.resumable && existing ? { resumed: resumed.map(([id]) => id) } : {}),
+                })
+            );
+            for (const [id, bridge] of resumed) {
+                for (const queued of bridge.parked || []) agent.sendWs(id, queued.data, queued.isBinary);
+                bridge.parked = null;
+                bridge.parkedBytes = 0;
+            }
             console.log(`[relay] agent registered${auth.subject ? ` for ${auth.subject}` : ''}; agents=${agents.size}`);
             return;
         }
@@ -910,6 +978,17 @@ function handleAgent(ws) {
             agent.acks?.clear();
         }
         if (agent && agents.get(agent.tokenHash) === agent) {
+            if (agent.resumable && agent.sockets.size) {
+                const gone = agent;
+                gone.goAway(() => {
+                    if (agents.get(gone.tokenHash) !== gone) return;
+                    agents.delete(gone.tokenHash);
+                    gone.destroy();
+                    console.log(`[relay] agent did not resume; agents=${agents.size}`);
+                });
+                console.log(`[relay] agent disconnected; holding ${gone.sockets.size} phone socket(s) for ${RESUME_GRACE_MS / 1000}s`);
+                return;
+            }
             agents.delete(agent.tokenHash);
             agent.destroy();
             console.log(`[relay] agent disconnected; agents=${agents.size}`);
@@ -964,13 +1043,25 @@ function sendToPhone(agent, id, data, isBinary) {
     }
 }
 
-function handleClientSocket(clientWs, agent, path) {
-    const id = agent.id('w');
-    const bridge = { client: clientWs, opened: false, queue: [], queued: 0 };
-    agent.sockets.set(id, bridge);
-    agent.send({ t: 'wopen', id, path });
+function handleClientSocket(clientWs, firstAgent, path) {
+    const id = firstAgent.id('w');
+    // `bridge.agent` changes when the desktop resumes on a new agent socket.
+    const bridge = { client: clientWs, agent: firstAgent, opened: false, queue: [], queued: 0, parked: null, parkedBytes: 0 };
+    firstAgent.sockets.set(id, bridge);
+    firstAgent.send({ t: 'wopen', id, path });
 
     clientWs.on('message', (data, isBinary) => {
+        const { agent } = bridge;
+        if (agent.away && bridge.parked) {
+            bridge.parkedBytes += data.length;
+            if (bridge.parkedBytes > PARK_QUEUE_MAX) {
+                bridge.parked = [];
+                clientWs.close(1012, 'Desktop disconnected');
+                return;
+            }
+            bridge.parked.push({ data, isBinary });
+            return;
+        }
         if (bridge.opened) {
             agent.sendWs(id, data, isBinary);
             agent.throttle(clientWs);
@@ -986,6 +1077,7 @@ function handleClientSocket(clientWs, agent, path) {
     });
 
     clientWs.on('close', (code, reason) => {
+        const { agent } = bridge;
         if (agent.sockets.has(id)) {
             agent.sockets.delete(id);
             agent.send({ t: 'wclose', id, code: sanitizeCloseCode(code), reason: reason?.toString() });
@@ -998,7 +1090,7 @@ function handleClientSocket(clientWs, agent, path) {
 // Terminate dead agent connections.
 const pinger = setInterval(() => {
     for (const agent of agents.values()) {
-        if (agent.paused) continue; // pongs aren't read while paused; flow control has its own timeout
+        if (agent.paused || agent.away) continue; // pongs aren't read while paused; flow control has its own timeout
         if (!agent.isAlive) {
             try {
                 agent.ws.terminate();
