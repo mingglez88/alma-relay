@@ -860,6 +860,63 @@ if (!EXTERNAL || ARGS.includes('--protocol3')) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Suite: resume — a desktop whose relay socket drops comes back and keeps its
+// phone sockets; each phone socket's fate is its own
+// ---------------------------------------------------------------------------
+{
+    console.log('  — resume');
+    const relay = await startRelay({ RESUME_GRACE_S: '3' });
+    const CODE = newCode();
+    const base = `${relay.origin}/c/${CODE}`;
+    const wsBase = base.replace(/^http/, 'ws');
+    try {
+        const agent = await connected({ relay: relay.origin, code: CODE, proto: 3, resume: true });
+        const a = await openPhoneSocket(`${wsBase}/ws/echo`);
+        const b = await openPhoneSocket(`${wsBase}/ws/echo`);
+        const c = await openPhoneSocket(`${wsBase}/ws/echo`);
+        a.send('a1');
+        await waitFor(() => a.messages.length === 1 && agent.sockets.size === 3);
+        const [idA, idB, idC] = [...agent.sockets.keys()];
+
+        agent.drop();
+        await sleep(300 * SLACK);
+        a.send('a2'); // held by the relay until the desktop is back
+        b.close(); // one phone leaving touches no other
+        await sleep(300 * SLACK);
+        const away = await fetch(`${base}/api/health`);
+        check('while the desktop is away, requests get 502', away.status === 502, `status=${away.status}`);
+
+        agent.opts.resumeOnly = [idA, idB]; // the desktop no longer holds c
+        await agent.connect();
+        const resumed = agent.registered.resumed || [];
+        check('the desktop resumes the phone sockets it still holds', resumed.includes(idA) && !resumed.includes(idB) && !resumed.includes(idC), JSON.stringify(agent.registered));
+        check('…a phone socket it did not list is closed alone', (await Promise.race([c.closedWith, sleep(3000 * SLACK).then(() => 'open')])) === 1012);
+        check('…what a phone sent meanwhile arrives', await waitFor(() => a.messages.includes('a2')), JSON.stringify(a.messages));
+        a.send('a3');
+        check('…and the kept socket carries on', await waitFor(() => a.messages.includes('a3')) && a.readyState === WebSocket.OPEN, JSON.stringify(a.messages));
+        const res = await fetch(`${base}/api/health`);
+        check('…and the tunnel serves requests again', res.status === 200, `status=${res.status}`);
+
+        agent.drop();
+        const t0 = Date.now();
+        const code = await Promise.race([a.closedWith, sleep(10000 * SLACK).then(() => 'open')]);
+        check('a desktop that does not come back loses its phones after the grace', code === 1012 && Date.now() - t0 >= 2500, `code=${code} after ${Date.now() - t0}ms`);
+
+        // A desktop that does not resume drops every phone socket, as before.
+        const plain = await connected({ relay: relay.origin, code: CODE, proto: 3 });
+        const d = await openPhoneSocket(`${wsBase}/ws/echo`);
+        await waitFor(() => plain.sockets.size === 1);
+        await connected({ relay: relay.origin, code: CODE, proto: 3 });
+        check('a desktop without resume drops its phone sockets on reconnect', (await Promise.race([d.closedWith, sleep(3000 * SLACK).then(() => 'open')])) === 1012);
+    } catch (e) {
+        check('suite: resume', false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        relay.stop();
+    }
+}
+
 backend.close();
 for (const client of backendWss.clients) client.terminate();
 console.log(failures === 0 ? '\n[e2e] ALL PASS' : `\n[e2e] ${failures} FAILURE(S)`);

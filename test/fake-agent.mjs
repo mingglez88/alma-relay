@@ -13,7 +13,9 @@ export class FakeAgent {
     /**
      * @param {{relay: string, code: string, backendPort: number, key?: string, wopenDelayMs?: number, agentQuery?: string, proto?: number}} opts
      *   `proto` is the protocol version offered in `register` (omitted: a
-     *   protocol-1 desktop that never mentions it).
+     *   protocol-1 desktop that never mentions it). With `resume`, the agent
+     *   keeps its backend sockets when its relay socket drops and lists them
+     *   in `register` when it connects again (`resumeOnly` narrows the list).
      */
     constructor(opts) {
         this.opts = opts;
@@ -51,7 +53,17 @@ export class FakeAgent {
                 }
             };
             ws.on('open', () =>
-                ws.send(JSON.stringify({ t: 'register', tokenHash: th, name: 'test-desktop', ver: 'test', key, ...(this.opts.proto ? { proto: this.opts.proto } : {}) }))
+                ws.send(
+                    JSON.stringify({
+                        t: 'register',
+                        tokenHash: th,
+                        name: 'test-desktop',
+                        ver: 'test',
+                        key,
+                        ...(this.opts.proto ? { proto: this.opts.proto } : {}),
+                        ...(this.opts.resume ? { resume: [...this.sockets.keys()].filter(id => !this.opts.resumeOnly || this.opts.resumeOnly.includes(id)) } : {}),
+                    })
+                )
             );
             ws.on('message', (data, isBinary) => {
                 if (isBinary) {
@@ -63,6 +75,21 @@ export class FakeAgent {
                     this.registered = frame;
                     this.proto = this.opts.proto >= 2 && frame.proto >= 2 ? Math.min(this.opts.proto, frame.proto) : 1;
                     if (this.proto >= 3) this.window = frame.window;
+                    if (this.opts.resume) {
+                        // Sockets the relay did not keep are gone; the kept ones start a fresh window.
+                        const kept = new Set(frame.resumed || []);
+                        for (const [id, s] of this.sockets) {
+                            if (!kept.has(id)) {
+                                this.sockets.delete(id);
+                                s.terminate();
+                                continue;
+                            }
+                            this.unacked.set(id, 0);
+                            const release = this.waiting.get(id);
+                            this.waiting.delete(id);
+                            release?.();
+                        }
+                    }
                     return settle(resolve);
                 }
                 if (frame.t === 'error') {
@@ -73,7 +100,7 @@ export class FakeAgent {
             });
             ws.on('close', (c, r) => {
                 this.closed = { code: c, reason: r.toString() };
-                for (const s of this.sockets.values()) s.terminate();
+                if (!this.opts.resume) for (const s of this.sockets.values()) s.terminate();
                 settle(reject, new Error(`closed ${c} ${r}`));
             });
             ws.on('error', err => settle(reject, err));
@@ -259,6 +286,11 @@ export class FakeAgent {
                 this.pushReplies.push(frame);
                 break;
         }
+    }
+
+    /** The relay socket dies without a close frame, as when the network drops. */
+    drop() {
+        this.ws?.terminate();
     }
 
     close() {
