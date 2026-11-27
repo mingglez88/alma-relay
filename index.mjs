@@ -22,7 +22,16 @@ import { connect as http2Connect, constants as http2Constants } from 'node:http2
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { WebSocketServer, WebSocket } from 'ws';
-import { apnsSignerFromEnv, apnsTopic, apnsHost, apnsRequestHeaders, clampBatch, validateNotification, resultFromResponse } from './apns.mjs';
+import {
+    apnsSignerFromEnv,
+    apnsTopic,
+    apnsHost,
+    apnsRequestHeaders,
+    clampBatch,
+    validateNotification,
+    resultFromResponse,
+    isExpiredProviderToken,
+} from './apns.mjs';
 import { fcmSenderFromEnv, deliverPush } from './fcm.mjs';
 import {
     AckBatcher,
@@ -154,14 +163,21 @@ async function sendPushBatch(notifications) {
             continue;
         }
         try {
+            const post = async auth => {
+                const { status, body } = await apnsPostHttp2(
+                    apnsHost(n.environment),
+                    `/3/device/${n.token}`,
+                    apnsRequestHeaders(auth, APNS_TOPIC, n),
+                    JSON.stringify(n.payload)
+                );
+                return resultFromResponse(status, body);
+            };
+            // One token for the whole relay, reused for TOKEN_TTL_MS (apns.mjs);
+            // an expired one is replaced once and the notification resent.
             const auth = await apnsSigner.token();
-            const { status, body } = await apnsPostHttp2(
-                apnsHost(n.environment),
-                `/3/device/${n.token}`,
-                apnsRequestHeaders(auth, APNS_TOPIC, n),
-                JSON.stringify(n.payload)
-            );
-            results.push({ token: n.token, ...resultFromResponse(status, body) });
+            let result = await post(auth);
+            if (isExpiredProviderToken(result)) result = await post(await apnsSigner.refresh(auth));
+            results.push({ token: n.token, ...result });
         } catch (err) {
             results.push({ token: n.token, status: 0, reason: err instanceof Error ? err.message : String(err) });
         }

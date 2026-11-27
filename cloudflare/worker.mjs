@@ -10,10 +10,11 @@
 // WebSocket Hibernation API, so an idle pairing costs ~nothing: the runtime
 // auto-answers the agent's keepalive pings without waking the DO.
 //
-// Free-plan friendly: SQLite-backed DO class, no storage writes at all.
+// Free-plan friendly: SQLite-backed DO class. The only storage write is the
+// shared APNs provider token, once per TOKEN_TTL_MS (see apnsTokens).
 
 import { DurableObject } from 'cloudflare:workers';
-import { apnsSignerFromEnv, apnsTopic, sendWithFetch } from '../apns.mjs';
+import { SharedApnsToken, apnsSignerFromEnv, apnsTopic, sendWithFetch } from '../apns.mjs';
 import { fcmSenderFromEnv, deliverPush } from '../fcm.mjs';
 import {
     BIN,
@@ -187,6 +188,41 @@ function legacyTunnelFor(env, th) {
     return locationHint(env) ? env.TUNNEL.get(env.TUNNEL.idFromName(th)) : null;
 }
 
+// One APNs provider token for the whole deployment. Apple rejects a key
+// whose token changes more often than every 20 min (TooManyProviderTokenUpdates),
+// and a token cached on each TunnelDO was minted again by every tunnel and
+// after every hibernation wake-up. The token lives in one Durable Object
+// (named below, never a tunnel hash), persisted there so an eviction keeps it;
+// each isolate caches it until TOKEN_TTL_MS. Should that object be
+// unreachable, the isolate signs its own rather than drop the notification.
+const APNS_TOKEN_OBJECT = 'apns:provider-token';
+let apnsShared = null; // per isolate: {env key, SharedApnsToken}
+
+function apnsTokenObject(env) {
+    const hint = locationHint(env);
+    const id = env.TUNNEL.idFromName(APNS_TOKEN_OBJECT);
+    return hint ? env.TUNNEL.get(id, { locationHint: hint }) : env.TUNNEL.get(id);
+}
+
+/** The deployment's shared APNs token source, or null without an APNs key. Throws on a malformed key. */
+export function apnsTokens(env, tokenObject = apnsTokenObject) {
+    if (!env.APNS_KEY) return null;
+    if (apnsShared?.key === env.APNS_KEY && apnsShared.keyId === env.APNS_KEY_ID) return apnsShared.source;
+    const local = apnsSignerFromEnv(env);
+    const source = new SharedApnsToken(async rejected => {
+        try {
+            const got = await tokenObject(env).apnsProviderToken(rejected);
+            if (got) return got;
+        } catch (err) {
+            console.warn('[relay] shared APNs token unavailable, signing locally:', err instanceof Error ? err.message : err);
+        }
+        if (rejected) await local.refresh(rejected);
+        return local.current();
+    });
+    apnsShared = { key: env.APNS_KEY, keyId: env.APNS_KEY_ID, source };
+    return source;
+}
+
 export class TunnelDO extends DurableObject {
     constructor(ctx, env) {
         super(ctx, env);
@@ -202,10 +238,13 @@ export class TunnelDO extends DurableObject {
         this.counter = 0;
         // Protocol 3: response body / WebSocket bytes acknowledged per stream.
         this.acks = new AckBatcher((id, n) => this.sendToAgent({ t: 'ack', id, n }));
-        // APNs signer (see ../../apns.mjs); null when the deployment has no
-        // APNS_KEY secret — the agent is then told `unsupported` and the
-        // desktop stops trying. The provider token is cached on the instance.
+        // APNs token source (apnsTokens above); null when the deployment has
+        // no APNS_KEY secret — the agent is then told `unsupported` and the
+        // desktop stops trying.
         this.apns = undefined;
+        // The signer behind the shared token, on the one object named
+        // APNS_TOKEN_OBJECT only (apnsProviderToken).
+        this.apnsLocal = undefined;
         // FCM sender (see ../../fcm.mjs) from the FCM_SERVICE_ACCOUNT secret;
         // null without one. Android notifications then come back FcmUnsupported.
         this.fcm = undefined;
@@ -226,13 +265,34 @@ export class TunnelDO extends DurableObject {
     apnsSigner() {
         if (this.apns === undefined) {
             try {
-                this.apns = apnsSignerFromEnv(this.env);
+                this.apns = apnsTokens(this.env);
             } catch (err) {
                 console.error('[relay] APNs key misconfigured:', err instanceof Error ? err.message : err);
                 this.apns = null;
             }
         }
         return this.apns;
+    }
+
+    /**
+     * RPC, on the object named APNS_TOKEN_OBJECT: the deployment's provider
+     * token as {token, at}, minted only when the stored one is older than
+     * TOKEN_TTL_MS, or is the very token Apple called expired (`rejected`).
+     */
+    async apnsProviderToken(rejected = null) {
+        if (this.apnsLocal === undefined) this.apnsLocal = apnsSignerFromEnv(this.env);
+        const signer = this.apnsLocal;
+        if (!signer) return null;
+        if (!signer.cached) {
+            const saved = await this.ctx.storage.get('apnsToken');
+            if (saved && saved.keyId === signer.keyId && typeof saved.token === 'string') signer.cached = { token: saved.token, at: saved.at };
+        }
+        const before = signer.cached?.token;
+        if (rejected) await signer.refresh(rejected);
+        else await signer.current();
+        const { token, at } = signer.cached;
+        if (token !== before) await this.ctx.storage.put('apnsToken', { token, at, keyId: signer.keyId });
+        return { token, at };
     }
 
     // Agent asked us to notify its phone(s). The desktop never sees the APNs
